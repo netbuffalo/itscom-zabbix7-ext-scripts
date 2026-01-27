@@ -1,0 +1,210 @@
+#!/opt/pyenv/versions/2.7.18/bin/python
+# -*- encoding: utf-8 -*-
+#
+# version    : 1.3.6
+# author     : shosaka@ossbn.co.jp
+# created at : 2016.02.23
+# updated at : 2016.04.11
+
+from snmpTarget import SnmpTarget
+import os, sys, hashlib, time, json
+import logging, logging.handlers
+import fcntl
+import traceback
+
+class SnmpDiscovery(object):
+
+    def __init__(self, targetHost='localhost', community='public', port=161):
+        self.targetHost = targetHost
+        self.community = community
+        self.port = port
+        self.maxCacheTimeInSec = 3600
+
+    def discover(self, oids, names, enums={}, pathToCache=None):
+        """ This function is not thread safe. """
+        et = None
+        isCacheUsed = False
+        # for zabbix data
+        data = []
+        dict4zbx = {}
+
+        if pathToCache:
+            et = self.parseTimeElapsed(pathToCache)
+
+        if et is None or et > int(self.maxCacheTimeInSec):
+            # snmpnext walk
+            target = SnmpTarget(host, community)
+            error, rows = target.nextWalk(oids, 3, 1, 3000) # oids, timeout(sec), retries, max number of fetch rows.
+            #+------+---------+----------------+---------------------+
+            #| oids | ifIndex |  ifDescr(oid1) | ifAdminStatus(oid2) |
+            #+------+---------+----------------+---------------------+
+            #| row1 |    1    |    ifDescr.1   |      status.1       |
+            #+------+---------+----------------+---------------------+
+            #| row2 |    2    |    ifDescr.2   |      status.2       |
+            #+------+---------+----------------+---------------------+
+            row_id = 0
+            for row in rows:
+                row4json = {} # table row data
+                idx4json = None # SNMPINDEX value
+                for i in xrange(0, len(oids)): # fetch each column(oid)s
+                    var = row[i] # ObjectType(ObjectIdentity(ObjectName('1.3.6.1.2.1.2.2.1.2.1')), OctetString('LAN1'))
+                    name = names[i] # variable name for zabbix.
+                    idx = (str(var[0])).replace(oids[i] + ".", "")
+                    if idx4json is None: # first column index?
+                        idx4json = idx # first column index is row global SNMPINDEX.
+                        row4json['{#SNMPINDEX}'] = idx4json
+                        row4json['{#ID}'] = row_id
+                        row_id += 1
+                        if '.' in idx4json:
+                            subIndexes = idx4json.split('.')
+                            for i in xrange(0, len(subIndexes)):
+                                row4json['{#SNMPSUBINDEX%s}' % str(i+1)] = subIndexes[i]
+                    if idx == idx4json: # snmp index same as row gloal index?
+                        # http://pysnmp.sourceforge.net/faq/response-values-mib-resolution.html
+                        rawVal = var[1].prettyPrint()
+                        if enums.has_key(name) and enums[name].has_key(rawVal):
+                            row4json[name] = enums[name][rawVal]
+                        else:
+                            row4json[name] = rawVal
+                    else:
+                        row4json[name] = '' # index not match. set empty value.
+
+                data.append(row4json) # store row values.
+
+            dict4zbx["data"] = data
+            json4zbx = json.dumps(dict4zbx)
+
+            if pathToCache is not None:
+                with open(pathToCache, mode='w') as fh:
+                    fh.write(json4zbx) # write new cache.
+        else:
+            with open(pathToCache, "r") as fh:
+                json4zbx = fh.read()
+            isCacheUsed = True
+
+        return (isCacheUsed, json4zbx)
+
+    def parseTimeElapsed(self, f):
+        if os.path.isfile(f):
+            mt = os.path.getmtime(f)
+            now = time.time()
+            etime = now - mt
+            return int(etime)
+        else:
+            return None
+
+
+if __name__ == '__main__':
+
+    """
+        Syntax)
+            snmpDiscovery discoveryName cacheTimeInSec snmpCommunity hostAddress (Zabbix)Variable OID
+
+        Basic)
+            snmpDiscovery myDiscovery1 0 public 192.0.0.24 {#ifDescr} 1.3.6.1.2.1.2.2.1.2
+
+        Multiple columns)
+            snmpDiscovery.py myDiscovery2 0 public 192.0.0.24 {#ifDescr} 1.3.6.1.2.1.2.2.1.2 {#ifOperStatus} 1.3.6.1.2.1.2.2.1.8
+
+        Enumeration)
+            snmpDiscovery myDiscovery3 0 public 192.0.0.24 {#ifDescr} 1.3.6.1.2.1.2.2.1.2 {#ifOperStatus} '1.3.6.1.2.1.2.2.1.8?up=1&down=2'
+    """
+
+    cdir = os.path.abspath(os.path.dirname(__file__))
+    snmp_log = cdir + "/logs/snmp.discovery.log"
+    log_level = logging.ERROR
+    if os.path.exists(cdir + '/logs/_INFO_'):
+        log_level = logging.INFO
+    if os.path.exists(cdir + '/logs/_DEBUG_'):
+        log_level = logging.DEBUG
+    # logging
+    logger = logging.getLogger()
+    logger.setLevel(log_level)
+    formatter = logging.Formatter('%(asctime)s %(levelname)s - %(message)s')
+
+    rfh = logging.handlers.RotatingFileHandler(
+        filename=snmp_log,
+        maxBytes=2000000, # MB
+        backupCount=5
+    )
+
+    rfh.setLevel(log_level)
+    rfh.setFormatter(formatter)
+    logger.addHandler(rfh)
+
+    #stdout = logging.StreamHandler()
+    #stdout.setLevel(logging.DEBUG)
+    #stdout.setFormatter(formatter)
+    #logger.addHandler(stdout)
+
+    args = sys.argv
+    logger.info(args)
+
+    names = []
+    oids = []
+    enums = {}
+    cacheSec = None
+    community = None
+    host = None
+    try:
+        discoveryName = args[1]
+        cacheSec = args[2]
+        community = args[3]
+        host = args[4]
+        # define discovery cache file.
+        for i in xrange(5, len(args), 2): # 2 up by each loop.
+            name = args[i]
+            names.append(name)
+            oid_arg = args[i+1]
+            if '?' in oid_arg: # oid include '?' char?
+                # '1.3.6.1.2.1.2.2.1.8?up=1&down=2'
+                oid, options = oid_arg.split('?')
+                oids.append(oid.strip('.')) # strip first dot char.
+                params = options.split('&') # ['up=1', 'down=2']
+                for p in params:
+                    humanVal, rawVal = p.split('=') # humanVal(up), rawVal(1)
+                    if enums.has_key(name):
+                        enums[name].update({rawVal: humanVal}) # {'{#ifOperStatus}': {'1':'up', '2':'down'}}
+                    else:
+                        enums[name] = {rawVal: humanVal}
+            else:
+                oids.append(oid_arg.strip('.'))
+
+        cacheDir = cdir + "/cache"
+        cacheName =  'discovery.snmp.' + hashlib.md5(host + ':' + ':'.join(oids) + ':'.join(names)).hexdigest()
+        pathToCache = cacheDir + '/' + cacheName + '.cache'
+        pathToLock = cacheDir + '/' + cacheName + '.lock'
+        # open or create lock file.
+        with open(pathToLock, 'w+') as lf:
+            try:
+                # get discover lock (wait when instance cannot obtain discover lock).
+                # fcntl.flock(lf.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB) # no wait (exception occurred).
+                fcntl.flock(lf.fileno(), fcntl.LOCK_EX) # wait until release lock.
+                # start snmp discovery.
+                json4zbx = None
+                dis = SnmpDiscovery(host, community)
+                dis.maxCacheTimeInSec = cacheSec
+                isCacheUsed, json4zbx = dis.discover(oids, names, enums, pathToCache)
+                print json4zbx
+                if isCacheUsed:
+                    logger.info("name: %s, host: %s, cache file: %s, data: cache" % (args[1], host, pathToCache))
+                else:
+                    logger.info("name: %s, host: %s, cache file: %s, data: snmp" % (args[1], host, pathToCache))
+                    logger.debug(json4zbx)
+            finally:
+                fcntl.flock(lf.fileno(), fcntl.LOCK_UN) # release lock.
+    except Exception as e:
+        logger.error("Oops! Exception caught:", exc_info=True)
+        #if logger.getEffectiveLevel() is logging.DEBUG:
+        #    # for remote debug
+        #    em = EMail()
+        #    em.smtp_host = 'smtp.gmail.com'
+        #    em.smtp_port = 587
+        #    em.smtp_username = 'zabbix.ossbn@gmail.com'
+        #    em.smtp_password = 'ossbroadnet'
+        #    em.subject = "Exception caught: %s" % args[0]
+        #    em.body = "args -> %s \n messages -> %s" % (str(args), str(e))
+        #    em.attach('details.txt', traceback.format_exc())
+        #    mailto = ['shosaka@ossbn.co.jp']
+        #    em.send(mailto)
+
